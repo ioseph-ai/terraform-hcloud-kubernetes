@@ -577,21 +577,18 @@ resource "terraform_data" "bare_metal_server" {
       fi
 
       # ============================================================
-      # RAID 1 support: write Talos to all physical disks so the
-      # system can boot from any disk. The EPHEMERAL partition
-      # (where container data lives) is created by Talos on first
-      # boot, so we can't create a RAID array during provisioning.
+      # RAID 1 support: create a true mdadm RAID1 array, then dd
+      # the Talos metal image to /dev/md0. Talos boots from md127
+      # (the runtime name of md0) with both disks fully mirrored.
       #
-      # Data redundancy is provided by:
-      # 1. Boot redundancy: bootloader on all physical disks
-      # 2. Application replication: Mimir RF=2, Kafka RF=3 across nodes
-      #
-      # For RAID 1 of the EPHEMERAL partition, configure it post-boot
-      # via Talos machine config patches (mdadm assemble + mount).
+      # This is TRUE RAID 1 — boot + data + partitions are all
+      # mirrored. Requires:
+      # - siderolabs/mdadm extension in the metal schematic
+      # - install.disk: /dev/md0 in the machine config
       # ============================================================
       raid_device=""
       if [ "$raid_mode" = "raid1" ] && [ "$${#install_disks[@]}" -ge 2 ]; then
-        printf 'RAID 1: writing Talos to %s disks for boot redundancy\n' "$${#install_disks[@]}"
+        printf 'RAID 1: creating mdadm array across %s disks\n' "$${#install_disks[@]}"
 
         # Stop any existing RAID arrays on these disks
         mdadm --stop /dev/md0 2>/dev/null || true
@@ -608,31 +605,50 @@ resource "terraform_data" "bare_metal_server" {
         udevadm settle
         sleep 2
 
-        # Write Talos image to ALL physical disks (bootloader on each)
+        # Assemble the RAID1 array (metadata 1.0 for boot compatibility)
+        disk_args=""
         for disk in "$${install_disks[@]}"; do
-          printf 'RAID 1: writing Talos to %s\n' "$disk"
-          wget \
-            --quiet \
-            --timeout=20 \
-            --waitretry=5 \
-            --tries=5 \
-            --retry-connrefused \
-            --inet4-only \
-            --output-document=- \
-            "${local.talos_metal_disk_image_urls[each.key]}" \
-          | zstd -dc \
-          | dd of="$disk" bs=1M iflag=fullblock oflag=direct conv=fsync status=none
-          sync
-          partprobe "$disk" >/dev/null 2>&1 || blockdev --rereadpt "$disk" >/dev/null 2>&1
-          udevadm settle
+          disk_args="$disk_args $disk"
         done
+        yes | mdadm --create /dev/md0 --name=talos:boot --level=1 \
+          --raid-devices=$${#install_disks[@]} --metadata=1.0 $disk_args
+
+        # Wait for array to be clean (but don't block on full resync)
+        udevadm settle
+        sleep 5
+
+        array_state=$(cat /sys/block/md0/md/array_state 2>/dev/null || echo "unknown")
+        printf 'RAID 1: array created, state=%s\n' "$array_state"
+
+        if [ "$array_state" != "clean" ] && [ "$array_state" != "active" ] \
+           && [ "$array_state" != "clean-resyncing" ]; then
+          printf 'ERROR: RAID array did not reach usable state: %s\n' "$array_state" >&2
+          exit 1
+        fi
+
+        # Write Talos image to the RAID array (dd to /dev/md0)
+        printf 'RAID 1: writing Talos to /dev/md0\n'
+        wget \
+          --quiet \
+          --timeout=20 \
+          --waitretry=5 \
+          --tries=5 \
+          --retry-connrefused \
+          --inet4-only \
+          --output-document=- \
+          "${local.talos_metal_disk_image_urls[each.key]}" \
+        | zstd -dc \
+        | dd of=/dev/md0 bs=1M iflag=fullblock oflag=direct conv=fsync status=none
+        sync
+        partprobe /dev/md0 >/dev/null 2>&1 || blockdev --rereadpt /dev/md0 >/dev/null 2>&1
+        udevadm settle
 
         for disk in "$${install_disks[@]}"; do
-          print_disk "raid-boot" "$disk"
+          print_disk "raid1-member" "$disk"
         done
-        printf 'RAID 1: boot redundancy enabled (Talos on all disks)\n'
+        printf 'RAID 1: true mirroring enabled (Talos on /dev/md0)\n'
 
-        # Skip the single-disk write below — we already wrote to all disks
+        # Skip the single-disk write below — we already wrote to the RAID array
         skip_write=true
       else
         # No RAID — original single-disk flow

@@ -313,6 +313,34 @@ If `install_disk` is omitted, the module automatically selects the first eligibl
 > [!WARNING]
 > Installing Talos is destructive. The selected install disk is discarded before Talos is written, and all other eligible install disks are wiped. Existing data on those disks is lost.
 
+#### RAID 1 (Disk Mirroring)
+
+Set `raid_mode = "raid1"` on a bare metal nodepool to enable true RAID 1 mirroring across all eligible disks. This provides full boot + data redundancy — if one disk fails, the system continues running on the mirror.
+
+```hcl
+bare_metal_nodepools = [
+  {
+    name      = "bare-metal"
+    raid_mode = "raid1"
+    servers = [
+      { number = 1111111, private_ipv4 = "10.0.88.2" },
+      { number = 2222222, private_ipv4 = "10.0.88.3" }
+    ]
+  }
+]
+```
+
+How it works:
+
+1. The module boots the server into Hetzner rescue mode
+2. All eligible disks are detected and wiped
+3. An mdadm RAID1 array (`/dev/md0`) is created across all disks (metadata 1.0 for boot compatibility)
+4. The Talos metal image (with `siderolabs/mdadm` extension) is dd'd to `/dev/md0`
+5. The machine config includes `install.disk: /dev/md0`
+6. On reboot, Talos assembles the array as `md127` and boots from it
+
+The `siderolabs/mdadm` extension is automatically added to the per-node Talos Image Factory schematic when `raid_mode = "raid1"`. Since each bare metal node has its own static IP baked into the schematic's `extraKernelArgs`, the module already creates per-node schematics — the mdadm extension is simply included in the raid1 ones.
+
 </details>
 
 <!-- Cluster Access -->
