@@ -154,8 +154,9 @@ resource "talos_image_factory_schematic" "metal" {
           officialExtensions = (
             length(local.talos_metal_image_extensions_per_server[each.key]) > 0 ?
             [
-              for ext in local.talos_metal_image_extensions_per_server[each.key] :
-              data.talos_image_factory_extensions_versions.metal[0].extensions_info[ext].name
+              for info in data.talos_image_factory_extensions_versions.metal[0].extensions_info :
+              info.name
+              if contains(local.talos_metal_image_extensions_per_server[each.key], info.name)
             ] :
             []
           )
