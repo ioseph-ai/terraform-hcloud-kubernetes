@@ -66,7 +66,22 @@ locals {
     )
   )
 
-  talos_metal_image_extensions = local.talos_image_extensions_base
+  # Include mdadm extension when any bare metal nodepool uses raid1,
+  # so the data source validates it against the Talos version.
+  talos_metal_any_raid1 = anytrue([
+    for np in local.bare_metal_nodepools : np.raid_mode == "raid1"
+  ])
+  talos_metal_image_extensions = distinct(concat(
+    local.talos_image_extensions_base,
+    local.talos_metal_any_raid1 ? ["siderolabs/mdadm"] : []
+  ))
+  # Per-server extensions: raid1 nodes get mdadm, others don't
+  talos_metal_image_extensions_per_server = {
+    for server_name, server in local.bare_metal_servers : server_name => distinct(concat(
+      local.talos_image_extensions_base,
+      local.bare_metal_nodepools_map[server.nodepool].raid_mode == "raid1" ? ["siderolabs/mdadm"] : []
+    ))
+  }
   talos_metal_image_common_extra_kernel_args = sort(distinct(
     concat(
       var.talos_extra_kernel_args,
@@ -137,8 +152,12 @@ resource "talos_image_factory_schematic" "metal" {
         extraKernelArgs = local.talos_metal_extra_kernel_args[each.key]
         systemExtensions = {
           officialExtensions = (
-            length(local.talos_metal_image_extensions) > 0 ?
-            data.talos_image_factory_extensions_versions.metal[0].extensions_info.*.name :
+            length(local.talos_metal_image_extensions_per_server[each.key]) > 0 ?
+            [
+              for info in data.talos_image_factory_extensions_versions.metal[0].extensions_info :
+              info.name
+              if contains(local.talos_metal_image_extensions_per_server[each.key], info.name)
+            ] :
             []
           )
         }

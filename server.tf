@@ -448,237 +448,358 @@ resource "terraform_data" "bare_metal_server" {
   provisioner "remote-exec" {
     inline = [
       <<-EOT
+      ROBOT_CRED='${var.hcloud_robot_user}:${nonsensitive(var.hcloud_robot_password)}'
       bash <<'SCRIPT'
-      set -euo pipefail
+      set -uo pipefail
 
-      for command in blkdiscard blockdev cat dd find grep head lsblk mdadm partprobe readlink sed sgdisk shutdown sort sync udevadm wget wipefs zstd; do
-        if ! command -v "$command" >/dev/null 2>&1; then
-          printf 'ERROR: required command not found: %s\n' "$command" >&2
-          exit 1
-        fi
+      # Deactivate any stale rescue boot config FIRST. The Robot rescue flag
+      # persists across reboots: if it is still armed when the install script
+      # issues its final `shutdown -r`, the box boots back into the rescue
+      # system instead of the freshly written Talos image. A POST without
+      # options deactivates the armed config; accept already-inactive states.
+      deactivate_status=$(curl -sS -o /dev/null -w '%%{http_code}' \
+        -u "$ROBOT_CRED" \
+        -X POST \
+        "${var.hcloud_robot_api_url}/boot/${each.value.number}/rescue" || true)
+      printf 'rescue deactivate status: %s\n' "$deactivate_status"
+
+      # Idempotency guard: never relaunch an install that already completed
+      # on this boot (provisioner re-runs after a poll-channel failure must
+      # not wipe a finished disk).
+      boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+      stored_boot_id=$(cat /root/.install_boot_id 2>/dev/null || echo none)
+      if pgrep -f 'bash /root/install_talos.sh' >/dev/null 2>&1; then
+        printf 'install already running on this boot; not relaunching\n'
+        exit 0
+      fi
+      if [ "$boot_id" = "$stored_boot_id" ] && grep -q 'INSTALL_DONE' /var/log/install.log 2>/dev/null; then
+        printf 'install already completed on this boot; skipping relaunch\n'
+        exit 0
+      fi
+
+      echo "$boot_id" > /root/.install_boot_id
+
+      cat > /root/install_talos.sh <<'INSTALL'
+  set -euo pipefail
+
+  # Idempotency guard: never relaunch an install that already completed
+  # on this boot (provisioner re-runs after a poll-channel failure must
+  # not wipe a finished disk).
+  boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+  stored_boot_id=$(cat /root/.install_boot_id 2>/dev/null || echo none)
+  if [ "$boot_id" = "$stored_boot_id" ] && grep -q 'INSTALL_DONE' /var/log/install.log 2>/dev/null; then
+    printf 'install already completed on this boot; skipping relaunch\n'
+    exit 0
+  fi
+
+  echo "$boot_id" > /root/.install_boot_id
+
+  trap 'printf "INSTALL_FAILED rc=%s\n" "$?" ; exit 1' ERR
+  printf 'INSTALL_START\n'
+
+    for command in blkdiscard blockdev cat dd find grep head lsblk mdadm partprobe readlink sed sgdisk shutdown sort sync udevadm wget wipefs zstd; do
+      if ! command -v "$command" >/dev/null 2>&1; then
+  printf 'ERROR: required command not found: %s\n' "$command" >&2
+  exit 1
+      fi
+    done
+
+    has_mounts_below() {
+      lsblk -nr -o MOUNTPOINTS "$1" 2>/dev/null | grep -q '[^[:space:]]'
+    }
+
+    lsblk_field() {
+      lsblk -dn -o "$2" "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]][[:space:]]*/ /g'
+    }
+
+    first_link() {
+      dir="$1"
+      dev="$2"
+
+      find -L "$dir" -samefile "$dev" ! -name '*-part*' -printf '%p\n' 2>/dev/null | sort | head -n1 || true
+    }
+
+    get_install_disks() {
+      udevadm settle
+
+      find /sys/block/ \
+  \( -name 'nvme[0-9]*n[0-9]' -o -name '[hvs]d[a-z]' -o -name 'xvd[a-z]' \) \
+  -printf '%f\n' \
+      | sort \
+      | while read -r name; do
+    dev="/dev/$name"
+
+    [ -b "$dev" ] || continue
+    [ "$(cat "/sys/block/$name/removable" 2>/dev/null)" = "0" ] || continue
+    [ "$(cat "/sys/block/$name/ro" 2>/dev/null)" = "0" ] || continue
+    [ "$(lsblk_field "$dev" TYPE)" = "disk" ] || continue
+    [ "$(lsblk_field "$dev" TRAN)" != "usb" ] || continue
+
+    if has_mounts_below "$dev"; then
+      printf 'skip disk=%s reason=mounted\n' "$dev" >&2
+      continue
+    fi
+
+    printf '%s\n' "$dev"
+  done
+    }
+
+    print_disk() {
+      role="$1"
+      dev="$2"
+
+      printf '%s disk=%s size="%s" model="%s" serial="%s" wwn="%s" tran="%s" by_id="%s" by_path="%s"\n' \
+  "$role" \
+  "$dev" \
+  "$(lsblk_field "$dev" SIZE)" \
+  "$(lsblk_field "$dev" MODEL)" \
+  "$(lsblk_field "$dev" SERIAL)" \
+  "$(lsblk_field "$dev" WWN)" \
+  "$(lsblk_field "$dev" TRAN)" \
+  "$(first_link /dev/disk/by-id "$dev")" \
+  "$(first_link /dev/disk/by-path "$dev")"
+    }
+
+    wipe_disk() {
+      disk="$1"
+
+      if has_mounts_below "$disk"; then
+  printf 'ERROR: refusing to wipe mounted disk=%s\n' "$disk" >&2
+  exit 1
+      fi
+
+      printf 'wipe disk=%s\n' "$disk"
+
+      wipefs --all --force "$disk" >/dev/null 2>&1
+      sgdisk --zap-all "$disk" >/dev/null 2>&1
+      blkdiscard -f "$disk" >/dev/null 2>&1 || true
+
+      dd if=/dev/zero of="$disk" bs=1M count=32 conv=fsync status=progress
+
+      size_bytes="$(blockdev --getsize64 "$disk" 2>/dev/null || printf '0')"
+      if [ "$size_bytes" -gt $((64 * 1024 * 1024)) ]; then
+  seek_mib=$((size_bytes / 1024 / 1024 - 32))
+  dd if=/dev/zero of="$disk" bs=1M seek="$seek_mib" count=32 conv=fsync status=progress
+      fi
+
+      partprobe "$disk" >/dev/null 2>&1 || blockdev --rereadpt "$disk" >/dev/null 2>&1
+      sync
+    }
+
+    configured_install_disk_id='${each.value.install_disk != null ? each.value.install_disk : ""}'
+    raid_mode='${each.value.raid_mode}'
+    mapfile -t install_disks < <(get_install_disks)
+
+    if [ "$${#install_disks[@]}" -eq 0 ]; then
+      printf '%s\n' 'ERROR: Could not detect install disk' >&2
+      exit 1
+    fi
+
+    if [ -n "$configured_install_disk_id" ]; then
+      case "$configured_install_disk_id" in
+  */*)
+    printf 'ERROR: install_disk must be a disk ID from /dev/disk/by-id, got %s\n' "$configured_install_disk_id" >&2
+    exit 1
+    ;;
+      esac
+
+      install_disk="$(readlink -f "/dev/disk/by-id/$configured_install_disk_id" 2>/dev/null || true)"
+      if [ -z "$install_disk" ]; then
+  printf 'ERROR: configured install_disk was not found in /dev/disk/by-id: %s\n' "$configured_install_disk_id" >&2
+  exit 1
+      fi
+    else
+      install_disk="$${install_disks[0]}"
+    fi
+
+    if [ -z "$install_disk" ] || [ ! -b "$install_disk" ]; then
+      printf '%s\n' 'ERROR: Could not detect install disk' >&2
+      exit 1
+    fi
+
+    if ! printf '%s\n' "$${install_disks[@]}" | grep -Fxq "$install_disk"; then
+      printf 'ERROR: configured install disk is not an eligible install disk: %s\n' "$install_disk" >&2
+      exit 1
+    fi
+
+    # ============================================================
+    # RAID 1 support: create a true mdadm RAID1 array, then dd
+    # the Talos metal image to /dev/md0. Talos boots from md127
+    # (the runtime name of md0) with both disks fully mirrored.
+    #
+    # This is TRUE RAID 1 — boot + data + partitions are all
+    # mirrored. Requires:
+    # - siderolabs/mdadm extension in the metal schematic
+    # - install.disk: /dev/md0 in the machine config
+    # ============================================================
+    raid_device=""
+    if [ "$raid_mode" = "raid1" ] && [ "$${#install_disks[@]}" -ge 2 ]; then
+      printf 'RAID 1: creating mdadm array across %s disks\n' "$${#install_disks[@]}"
+
+      # Stop any existing RAID arrays on these disks
+      mdadm --stop /dev/md0 2>/dev/null || true
+      mdadm --stop /dev/md127 2>/dev/null || true
+      # Remove stale superblocks from previous RAID attempts
+      for disk in "$${install_disks[@]}"; do
+  mdadm --zero-superblock "$disk" 2>/dev/null || true
       done
 
-      has_mounts_below() {
-        lsblk -nr -o MOUNTPOINTS "$1" 2>/dev/null | grep -q '[^[:space:]]'
-      }
+      # Wipe all disks
+      for disk in "$${install_disks[@]}"; do
+  wipe_disk "$disk"
+      done
+      udevadm settle
+      sleep 2
 
-      lsblk_field() {
-        lsblk -dn -o "$2" "$1" 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]][[:space:]]*/ /g'
-      }
+      # Assemble the RAID1 array (metadata 1.0 for boot compatibility).
+      # Feed confirmation via process substitution: `yes` must NOT be a
+      # pipeline member. With pipefail, `yes | mdadm` returns 141 when
+      # mdadm exits (SIGPIPE), and the ERR trap fires on that pipeline
+      # status even under `set +e` — observed as a deterministic
+      # INSTALL_FAILED rc=141 on both mg01 boxes. `< <(yes)` keeps the
+      # exit status equal to mdadm's own.
+      disk_args=""
+      for disk in "$${install_disks[@]}"; do
+  disk_args="$disk_args $disk"
+      done
+      mdadm --create /dev/md0 --name=talos:boot --level=1 \
+  --raid-devices=$${#install_disks[@]} --metadata=1.0 $disk_args \
+  < <(yes)
 
-      first_link() {
-        dir="$1"
-        dev="$2"
+      # Wait for array to be clean (but don't block on full resync)
+      udevadm settle
+      sleep 5
 
-        find -L "$dir" -samefile "$dev" ! -name '*-part*' -printf '%p\n' 2>/dev/null | sort | head -n1 || true
-      }
+      array_state=$(cat /sys/block/md0/md/array_state 2>/dev/null || echo "unknown")
+      printf 'RAID 1: array created, state=%s\n' "$array_state"
 
-      get_install_disks() {
-        udevadm settle
-
-        find /sys/block/ \
-          \( -name 'nvme[0-9]*n[0-9]' -o -name '[hvs]d[a-z]' -o -name 'xvd[a-z]' \) \
-          -printf '%f\n' \
-        | sort \
-        | while read -r name; do
-            dev="/dev/$name"
-
-            [ -b "$dev" ] || continue
-            [ "$(cat "/sys/block/$name/removable" 2>/dev/null)" = "0" ] || continue
-            [ "$(cat "/sys/block/$name/ro" 2>/dev/null)" = "0" ] || continue
-            [ "$(lsblk_field "$dev" TYPE)" = "disk" ] || continue
-            [ "$(lsblk_field "$dev" TRAN)" != "usb" ] || continue
-
-            if has_mounts_below "$dev"; then
-              printf 'skip disk=%s reason=mounted\n' "$dev" >&2
-              continue
-            fi
-
-            printf '%s\n' "$dev"
-          done
-      }
-
-      print_disk() {
-        role="$1"
-        dev="$2"
-
-        printf '%s disk=%s size="%s" model="%s" serial="%s" wwn="%s" tran="%s" by_id="%s" by_path="%s"\n' \
-          "$role" \
-          "$dev" \
-          "$(lsblk_field "$dev" SIZE)" \
-          "$(lsblk_field "$dev" MODEL)" \
-          "$(lsblk_field "$dev" SERIAL)" \
-          "$(lsblk_field "$dev" WWN)" \
-          "$(lsblk_field "$dev" TRAN)" \
-          "$(first_link /dev/disk/by-id "$dev")" \
-          "$(first_link /dev/disk/by-path "$dev")"
-      }
-
-      wipe_disk() {
-        disk="$1"
-
-        if has_mounts_below "$disk"; then
-          printf 'ERROR: refusing to wipe mounted disk=%s\n' "$disk" >&2
-          exit 1
-        fi
-
-        printf 'wipe disk=%s\n' "$disk"
-
-        wipefs --all --force "$disk" >/dev/null 2>&1
-        sgdisk --zap-all "$disk" >/dev/null 2>&1
-        blkdiscard -f "$disk" >/dev/null 2>&1 || true
-
-        dd if=/dev/zero of="$disk" bs=1M count=32 conv=fsync status=none
-
-        size_bytes="$(blockdev --getsize64 "$disk" 2>/dev/null || printf '0')"
-        if [ "$size_bytes" -gt $((64 * 1024 * 1024)) ]; then
-          seek_mib=$((size_bytes / 1024 / 1024 - 32))
-          dd if=/dev/zero of="$disk" bs=1M seek="$seek_mib" count=32 conv=fsync status=none
-        fi
-
-        partprobe "$disk" >/dev/null 2>&1 || blockdev --rereadpt "$disk" >/dev/null 2>&1
-        sync
-      }
-
-      configured_install_disk_id='${each.value.install_disk != null ? each.value.install_disk : ""}'
-      raid_mode='${each.value.raid_mode}'
-      mapfile -t install_disks < <(get_install_disks)
-
-      if [ "$${#install_disks[@]}" -eq 0 ]; then
-        printf '%s\n' 'ERROR: Could not detect install disk' >&2
-        exit 1
+      if [ "$array_state" != "clean" ] && [ "$array_state" != "active" ] \
+   && [ "$array_state" != "clean-resyncing" ]; then
+  printf 'ERROR: RAID array did not reach usable state: %s\n' "$array_state" >&2
+  exit 1
       fi
 
-      if [ -n "$configured_install_disk_id" ]; then
-        case "$configured_install_disk_id" in
-          */*)
-            printf 'ERROR: install_disk must be a disk ID from /dev/disk/by-id, got %s\n' "$configured_install_disk_id" >&2
-            exit 1
-            ;;
-        esac
+      # Write Talos image to the RAID array (dd to /dev/md0)
+      printf 'RAID 1: writing Talos to /dev/md0\n'
+      wget \
+  --quiet \
+  --timeout=20 \
+  --waitretry=5 \
+  --tries=5 \
+  --retry-connrefused \
+  --inet4-only \
+  --output-document=- \
+  "${local.talos_metal_disk_image_urls[each.key]}" \
+      | zstd -dc \
+      | dd of=/dev/md0 bs=1M iflag=fullblock oflag=direct conv=fsync status=progress
+      sync
+      partprobe /dev/md0 >/dev/null 2>&1 || blockdev --rereadpt /dev/md0 >/dev/null 2>&1
+      udevadm settle
 
-        install_disk="$(readlink -f "/dev/disk/by-id/$configured_install_disk_id" 2>/dev/null || true)"
-        if [ -z "$install_disk" ]; then
-          printf 'ERROR: configured install_disk was not found in /dev/disk/by-id: %s\n' "$configured_install_disk_id" >&2
-          exit 1
-        fi
-      else
-        install_disk="$${install_disks[0]}"
-      fi
+      for disk in "$${install_disks[@]}"; do
+  print_disk "raid1-member" "$disk"
+      done
+      printf 'RAID 1: true mirroring enabled (Talos on /dev/md0)\n'
 
-      if [ -z "$install_disk" ] || [ ! -b "$install_disk" ]; then
-        printf '%s\n' 'ERROR: Could not detect install disk' >&2
-        exit 1
-      fi
+      # Skip the single-disk write below — we already wrote to the RAID array
+      skip_write=true
+    else
+      # No RAID — original single-disk flow
+      skip_write=false
+      for disk in "$${install_disks[@]}"; do
+  if [ "$disk" = "$install_disk" ]; then
+    print_disk "select" "$disk"
+  else
+    print_disk "deboot" "$disk"
+  fi
+      done
 
-      if ! printf '%s\n' "$${install_disks[@]}" | grep -Fxq "$install_disk"; then
-        printf 'ERROR: configured install disk is not an eligible install disk: %s\n' "$install_disk" >&2
-        exit 1
-      fi
+      for disk in "$${install_disks[@]}"; do
+  [ "$disk" != "$install_disk" ] || continue
+  wipe_disk "$disk"
+      done
 
-      # ============================================================
-      # RAID 1 support: write Talos to all physical disks so the
-      # system can boot from any disk. The EPHEMERAL partition
-      # (where container data lives) is created by Talos on first
-      # boot, so we can't create a RAID array during provisioning.
-      #
-      # Data redundancy is provided by:
-      # 1. Boot redundancy: bootloader on all physical disks
-      # 2. Application replication: Mimir RF=2, Kafka RF=3 across nodes
-      #
-      # For RAID 1 of the EPHEMERAL partition, configure it post-boot
-      # via Talos machine config patches (mdadm assemble + mount).
-      # ============================================================
-      raid_device=""
-      if [ "$raid_mode" = "raid1" ] && [ "$${#install_disks[@]}" -ge 2 ]; then
-        printf 'RAID 1: writing Talos to %s disks for boot redundancy\n' "$${#install_disks[@]}"
+      wipe_disk "$install_disk"
+    fi
 
-        # Stop any existing RAID arrays on these disks
-        mdadm --stop /dev/md0 2>/dev/null || true
-        mdadm --stop /dev/md127 2>/dev/null || true
-        # Remove stale superblocks from previous RAID attempts
-        for disk in "$${install_disks[@]}"; do
-          mdadm --zero-superblock "$disk" 2>/dev/null || true
-        done
+    if [ "$skip_write" != "true" ]; then
+      printf 'write disk=%s talos=%s schematic=%s\n' \
+  "$install_disk" \
+  '${var.talos_version}' \
+  '${local.talos_metal_schematic_ids[each.key]}'
 
-        # Wipe all disks
-        for disk in "$${install_disks[@]}"; do
-          wipe_disk "$disk"
-        done
-        udevadm settle
-        sleep 2
+      wget \
+  --quiet \
+  --timeout=20 \
+  --waitretry=5 \
+  --tries=5 \
+  --retry-connrefused \
+  --inet4-only \
+  --output-document=- \
+  "${local.talos_metal_disk_image_urls[each.key]}" \
+      | zstd -dc \
+      | dd of="$install_disk" bs=1M iflag=fullblock oflag=direct conv=fsync status=progress
 
-        # Write Talos image to ALL physical disks (bootloader on each)
-        for disk in "$${install_disks[@]}"; do
-          printf 'RAID 1: writing Talos to %s\n' "$disk"
-          wget \
-            --quiet \
-            --timeout=20 \
-            --waitretry=5 \
-            --tries=5 \
-            --retry-connrefused \
-            --inet4-only \
-            --output-document=- \
-            "${local.talos_metal_disk_image_urls[each.key]}" \
-          | zstd -dc \
-          | dd of="$disk" bs=1M iflag=fullblock oflag=direct conv=fsync status=none
-          sync
-          partprobe "$disk" >/dev/null 2>&1 || blockdev --rereadpt "$disk" >/dev/null 2>&1
-          udevadm settle
-        done
+      sync
+    fi
 
-        for disk in "$${install_disks[@]}"; do
-          print_disk "raid-boot" "$disk"
-        done
-        printf 'RAID 1: boot redundancy enabled (Talos on all disks)\n'
+    printf 'done disk=%s talos=%s\n' "$install_disk" '${var.talos_version}'
+    printf 'INSTALL_DONE\n'
+    sync
+    shutdown -r +1
+  INSTALL
+  chmod 700 /root/install_talos.sh
 
-        # Skip the single-disk write below — we already wrote to all disks
-        skip_write=true
-      else
-        # No RAID — original single-disk flow
-        skip_write=false
-        for disk in "$${install_disks[@]}"; do
-          if [ "$disk" = "$install_disk" ]; then
-            print_disk "select" "$disk"
-          else
-            print_disk "deboot" "$disk"
-          fi
-        done
-
-        for disk in "$${install_disks[@]}"; do
-          [ "$disk" != "$install_disk" ] || continue
-          wipe_disk "$disk"
-        done
-
-        wipe_disk "$install_disk"
-      fi
-
-      if [ "$skip_write" != "true" ]; then
-        printf 'write disk=%s talos=%s schematic=%s\n' \
-          "$install_disk" \
-          '${var.talos_version}' \
-          '${local.talos_metal_schematic_ids[each.key]}'
-
-        wget \
-          --quiet \
-          --timeout=20 \
-          --waitretry=5 \
-          --tries=5 \
-          --retry-connrefused \
-          --inet4-only \
-          --output-document=- \
-          "${local.talos_metal_disk_image_urls[each.key]}" \
-        | zstd -dc \
-        | dd of="$install_disk" bs=1M iflag=fullblock oflag=direct conv=fsync status=none
-
-        sync
-      fi
-
-      printf 'done disk=%s talos=%s\n' "$install_disk" '${var.talos_version}'
-      printf '%s\n' 'reboot scheduled'
-
-      shutdown -r +1
+  # Detach: the install must survive SSH channel death (observed twice
+  # on 2026-09-11: silent heavy-IO phase killed the channel and tofu's
+  # retry re-wiped a half-written array).
+  nohup setsid bash /root/install_talos.sh > /var/log/install.log 2>&1 < /dev/null &
+  printf 'install launched detached (pid %s)\n' "$!"
+  exit 0
       SCRIPT
+    EOT
+    ]
+
+    connection {
+      type        = "ssh"
+      host        = local.bare_metal_initialization_ssh_hosts[each.key]
+      user        = "root"
+      private_key = tls_private_key.ssh_key.private_key_openssh
+      timeout     = "15m"
+    }
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      <<-EOT
+      bash <<'POLL'
+      set -uo pipefail
+      # Poll the detached install (20 min budget). Light periodic output
+      # keeps this SSH channel busy; if the channel still dies, the install
+      # continues box-side and the retry re-polls via the idempotency guard.
+      # Self-heal: if the install is not running and never completed,
+      # relaunch it — observed twice on mg01 (2026-09-11) that the
+      # launcher's channel died before the detached process took hold,
+      # leaving a 0-byte log while the poll channel itself was healthy.
+      for attempt in $(seq 1 80); do
+        if grep -q 'INSTALL_DONE' /var/log/install.log 2>/dev/null; then
+          printf 'install finished (poll %s/80)\n' "$attempt"
+          exit 0
+        fi
+        if ! pgrep -f 'bash /root/install_talos.sh' >/dev/null 2>&1; then
+          printf 'poll %s/80: install not running — relaunching\n' "$attempt"
+          nohup setsid bash /root/install_talos.sh > /var/log/install.log 2>&1 < /dev/null &
+        fi
+        if grep -q 'INSTALL_FAILED' /var/log/install.log 2>/dev/null; then
+          printf 'install reported failure (relaunch scheduled next poll)\n' >&2
+        fi
+        printf 'poll %s/80: install still running\n' "$attempt"
+        sleep 15
+      done
+      printf 'install did not finish within the poll window\n' >&2
+      tail -n 30 /var/log/install.log >&2 || true
+      exit 1
+      POLL
     EOT
     ]
 
