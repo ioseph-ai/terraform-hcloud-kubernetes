@@ -651,13 +651,23 @@ resource "terraform_data" "bare_metal_server" {
       udevadm settle
       sleep 2
 
-      # Assemble the RAID1 array (metadata 1.0 for boot compatibility)
+      # Assemble the RAID1 array (metadata 1.0 for boot compatibility).
+      # Scope out errexit for this pipeline: `yes` receives SIGPIPE (141)
+      # when mdadm exits, and pipefail would turn that into a fatal
+      # INSTALL_FAILED. We check mdadm's OWN exit code via PIPESTATUS.
       disk_args=""
       for disk in "$${install_disks[@]}"; do
   disk_args="$disk_args $disk"
       done
+      set +e
       yes | mdadm --create /dev/md0 --name=talos:boot --level=1 \
   --raid-devices=$${#install_disks[@]} --metadata=1.0 $disk_args
+      mdadm_rc=$${PIPESTATUS[1]}
+      set -e
+      if [ "$mdadm_rc" -ne 0 ]; then
+  printf 'ERROR: mdadm --create failed rc=%s\n' "$mdadm_rc" >&2
+  exit "$mdadm_rc"
+      fi
 
       # Wait for array to be clean (but don't block on full resync)
       udevadm settle
