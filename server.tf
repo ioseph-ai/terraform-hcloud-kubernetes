@@ -652,22 +652,19 @@ resource "terraform_data" "bare_metal_server" {
       sleep 2
 
       # Assemble the RAID1 array (metadata 1.0 for boot compatibility).
-      # Scope out errexit for this pipeline: `yes` receives SIGPIPE (141)
-      # when mdadm exits, and pipefail would turn that into a fatal
-      # INSTALL_FAILED. We check mdadm's OWN exit code via PIPESTATUS.
+      # Feed confirmation via process substitution: `yes` must NOT be a
+      # pipeline member. With pipefail, `yes | mdadm` returns 141 when
+      # mdadm exits (SIGPIPE), and the ERR trap fires on that pipeline
+      # status even under `set +e` — observed as a deterministic
+      # INSTALL_FAILED rc=141 on both mg01 boxes. `< <(yes)` keeps the
+      # exit status equal to mdadm's own.
       disk_args=""
       for disk in "$${install_disks[@]}"; do
   disk_args="$disk_args $disk"
       done
-      set +e
-      yes | mdadm --create /dev/md0 --name=talos:boot --level=1 \
-  --raid-devices=$${#install_disks[@]} --metadata=1.0 $disk_args
-      mdadm_rc=$${PIPESTATUS[1]}
-      set -e
-      if [ "$mdadm_rc" -ne 0 ]; then
-  printf 'ERROR: mdadm --create failed rc=%s\n' "$mdadm_rc" >&2
-  exit "$mdadm_rc"
-      fi
+      mdadm --create /dev/md0 --name=talos:boot --level=1 \
+  --raid-devices=$${#install_disks[@]} --metadata=1.0 $disk_args \
+  < <(yes)
 
       # Wait for array to be clean (but don't block on full resync)
       udevadm settle
@@ -780,15 +777,21 @@ resource "terraform_data" "bare_metal_server" {
       # Poll the detached install (20 min budget). Light periodic output
       # keeps this SSH channel busy; if the channel still dies, the install
       # continues box-side and the retry re-polls via the idempotency guard.
+      # Self-heal: if the install is not running and never completed,
+      # relaunch it — observed twice on mg01 (2026-09-11) that the
+      # launcher's channel died before the detached process took hold,
+      # leaving a 0-byte log while the poll channel itself was healthy.
       for attempt in $(seq 1 80); do
         if grep -q 'INSTALL_DONE' /var/log/install.log 2>/dev/null; then
           printf 'install finished (poll %s/80)\n' "$attempt"
           exit 0
         fi
+        if ! pgrep -f 'bash /root/install_talos.sh' >/dev/null 2>&1; then
+          printf 'poll %s/80: install not running — relaunching\n' "$attempt"
+          nohup setsid bash /root/install_talos.sh > /var/log/install.log 2>&1 < /dev/null &
+        fi
         if grep -q 'INSTALL_FAILED' /var/log/install.log 2>/dev/null; then
-          printf 'install reported failure\n' >&2
-          tail -n 30 /var/log/install.log >&2 || true
-          exit 1
+          printf 'install reported failure (relaunch scheduled next poll)\n' >&2
         fi
         printf 'poll %s/80: install still running\n' "$attempt"
         sleep 15
