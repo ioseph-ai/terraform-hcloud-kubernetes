@@ -480,18 +480,7 @@ resource "terraform_data" "bare_metal_server" {
       echo "$boot_id" > /root/.install_boot_id
 
       cat > /root/install_talos.sh <<'INSTALL'
-  set -uo pipefail
-
-  # Deactivate any stale rescue boot config FIRST. The Robot rescue flag
-  # persists across reboots: if it is still armed when the install script
-  # issues its final `shutdown -r`, the box boots back into the rescue
-  # system instead of the freshly written Talos image. A POST without
-  # options deactivates the armed config; accept already-inactive states.
-  deactivate_status=$(curl -sS -o /dev/null -w '%%{http_code}' \
-    -u "$ROBOT_CRED" \
-    -X POST \
-    "${var.hcloud_robot_api_url}/boot/${each.value.number}/rescue" || true)
-  printf 'rescue deactivate status: %s\n' "$deactivate_status"
+  set -euo pipefail
 
   # Idempotency guard: never relaunch an install that already completed
   # on this boot (provisioner re-runs after a poll-channel failure must
@@ -505,12 +494,8 @@ resource "terraform_data" "bare_metal_server" {
 
   echo "$boot_id" > /root/.install_boot_id
 
-  cat > /root/install_talos.sh <<'INSTALL'
-    set -euo pipefail
-  trap 'printf \'INSTALL_FAILED rc=$?\\n\' ; exit 1' ERR
-  printf \'INSTALL_START\\n\'
-    trap 'printf \'INSTALL_FAILED rc=$?\\n\' ; exit 1' ERR
-    printf \'INSTALL_START\\n\'
+  trap 'printf "INSTALL_FAILED rc=%s\n" "$?" ; exit 1' ERR
+  printf 'INSTALL_START\n'
 
     for command in blkdiscard blockdev cat dd find grep head lsblk mdadm partprobe readlink sed sgdisk shutdown sort sync udevadm wget wipefs zstd; do
       if ! command -v "$command" >/dev/null 2>&1; then
@@ -764,15 +749,6 @@ resource "terraform_data" "bare_metal_server" {
   nohup setsid bash /root/install_talos.sh > /var/log/install.log 2>&1 < /dev/null &
   printf 'install launched detached (pid %s)\n' "$!"
   exit 0
-      INSTALL
-      chmod 700 /root/install_talos.sh
-
-      # Detach: the install must survive SSH channel death (observed twice
-      # on 2026-09-11: silent heavy-IO phase killed the channel and tofu's
-      # retry re-wiped a half-written array).
-      nohup setsid bash /root/install_talos.sh > /var/log/install.log 2>&1 < /dev/null &
-      printf 'install launched detached (pid %s)\n' "$!"
-      exit 0
       SCRIPT
     EOT
     ]
